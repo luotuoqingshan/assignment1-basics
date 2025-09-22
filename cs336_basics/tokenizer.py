@@ -1,69 +1,143 @@
 import regex as re 
+from typing import Any
 
 
 def pre_tokenization(
-    word_count: dict[tuple[bytes], int],
     input: str,
+    words: list[tuple[bytes]],
+    token_pair_count: dict[tuple[bytes, bytes], int],    
+    token_pair_appear: dict[tuple[bytes, bytes], set[int]],
 ):
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     for match in re.finditer(PAT, input):
-        string = match.group().encode("utf-8")
-        token_bytes = tuple([string[i:i+1] for i in range(len(string))])
-        word_count[token_bytes] = word_count.get(token_bytes, 0) + 1
-    return word_count
+        word = match.group().encode("utf-8")
+        for i in range(len(word) - 1):
+            token_pair = tuple([word[i:i+1], word[i+1:i+2]])
+            token_pair_count[token_pair] = token_pair_count.get(token_pair, 0) + 1
+            
+            if token_pair not in token_pair_appear:
+                token_pair_appear[token_pair] = set[int]()
+            token_pair_appear[token_pair].add(len(words))
+        words.append(tuple([word[i:i+1] for i in range(len(word))]))            
+    
 
-
-def find_most_common_adj_token_pair(
-    word_count: dict[tuple[bytes], int], # each word is represented as tuple of bytes
+def find_most_common_token_pair(
+    token_pair_count: dict[tuple[bytes, bytes], int],
 ) -> tuple[bytes, bytes]:
-    adj_token_pair_count = dict[tuple[bytes, bytes], int]()
-    for word_tokens, count in word_count.items():
-        for i in range(len(word_tokens) - 1):
-            adj_token_pair = tuple([word_tokens[i], word_tokens[i+1]])
-            adj_token_pair_count[adj_token_pair] = (
-                adj_token_pair_count.get(adj_token_pair, 0) + count
-            )
 
-    most_common_adj_token_pair = (
+    most_common_token_pair = (
         max(
-            adj_token_pair_count, 
+            token_pair_count,
             # If two token pairs have the same frequency,
             # break the tie by merging the lexicographically greater pair
-            key=lambda adj_token_pair: (
-                adj_token_pair_count[adj_token_pair], 
-                adj_token_pair[0],
-                adj_token_pair[1],
+            key=lambda token_pair: (
+                token_pair_count[token_pair], 
+                token_pair[0],
+                token_pair[1],
             ),
         )
     )
-    return most_common_adj_token_pair
+    return most_common_token_pair
 
 
-def merge_most_common_adj_token_pair(
-    word_count: dict[tuple[bytes], int],
-    most_common_adj_token: tuple[bytes, bytes],
-) -> dict[tuple[bytes], int]:
-    new_word_count = dict[tuple[bytes], int]()
-    token1, token2 = most_common_adj_token
+def adjust(
+    token_pair_count: dict[tuple[bytes, bytes], int],
+    token_pair_appear: dict[tuple[bytes, bytes], set[int]],
+    old_token_pair: tuple[bytes, bytes],
+    new_token_pair: tuple[bytes, bytes],
+    word_id: int
+):
+    # one token pair can appear multiple times in one word, 
+    # it's not worthwhile to support deletion in token pair appearance dict
+    token_pair_count[old_token_pair] -= 1
+    token_pair_count[new_token_pair] = (
+        token_pair_count.get(new_token_pair, 0) + 1
+    )
+    if new_token_pair not in token_pair_appear:
+        token_pair_appear[new_token_pair] = set[int]()
+    token_pair_appear[new_token_pair].add(word_id)
+
+
+def add_token_pair_count(
+    token_pair_count: dict[tuple[bytes, bytes], int],
+    token_pair_appear: dict[tuple[bytes, bytes], set[int]],
+    token_pair: tuple[bytes, bytes],
+    word_idx: int,
+):
+    token_pair_count[token_pair] = (
+        token_pair_count.get(token_pair, 0) + 1
+    )
+    if token_pair not in token_pair_appear:
+        token_pair_appear[token_pair] = set[int]()
+    token_pair_appear[token_pair].add(word_idx)
+
+
+def sub_token_pair_count(
+    token_pair_count: dict[tuple[bytes, bytes], int],
+    token_pair: tuple[bytes, bytes],
+):
+    token_pair_count[token_pair] -= 1
+
+
+def merge_most_common_token_pair(
+    most_common_token_pair: tuple[bytes, bytes],
+    words,
+    token_pair_count: dict[tuple[bytes, bytes], int],
+    token_pair_appear: dict[tuple[bytes, bytes], set[int]],
+):
+    token1, token2 = most_common_token_pair
     merged_token = b"".join([token1, token2])
-    for word_tokens, count in word_count.items():
-        idx = 0
-        new_word_tokens = list[bytes]()
-        while idx < len(word_tokens):
+
+    # iterate through all words containing this token pair
+    for word_idx in token_pair_appear[most_common_token_pair]:
+        word = words[word_idx]
+        new_word = list[bytes]()
+        token_idx = 0
+        while token_idx < len(word):
+            # find the match
             if (
-                idx + 1 < len(word_tokens)
-                and word_tokens[idx] == token1 
-                and word_tokens[idx+1] == token2
+                token_idx + 1 < len(word) 
+                and word[token_idx] == token1 
+                and word[token_idx + 1] == token2
             ):
-                # merge
-                new_word_tokens.append(merged_token)
-                idx += 2
+                new_word.append(merged_token)
+
+                # adjust the adjacent token pairs
+                if token_idx > 0:
+                    prev_token = word[token_idx - 1]
+                    old_prev_token_pair = tuple([prev_token, token1])
+                    sub_count(token_pair_count, old_prev_token_pair)
+                if token_idx + 2 < len(word):
+                    next_token = word[token_idx + 2]
+                    old_next_token_pair = tuple([token2, next_token])
+                    sub_count(token_pair_count, old_next_token_pair)
+                token_idx += 2
             else:
-                new_word_tokens.append(word_tokens[idx])
-                idx += 1
-        new_word_tokens = tuple(new_word_tokens)
-        new_word_count[new_word_tokens] = new_word_count.get(new_word_tokens, 0) + count
-    return new_word_count
+                new_word.append(word[token_idx])
+                token_idx += 1
+        words[word_idx] = tuple(new_word)
+        for token_idx in range(len(new_word)):
+            token = new_word[token_idx]
+            if token == merged_token:
+                if token_idx > 0:
+                    prev_token = new_word[token_idx - 1]
+                    add_count(
+                        token_pair_count,
+                        token_pair_appear,
+                        tuple([prev_token, merged_token]),
+                        word_idx,
+                    )
+                if token_idx + 1 < len(new_word):
+                    next_token = new_word[token_idx + 1]
+                    add_count(
+                        token_pair_count,
+                        token_pair_appear,
+                        tuple([merged_token, next_token]),
+                        word_idx,
+                    )
+    
+    token_pair_count.pop(most_common_token_pair)
+    token_pair_appear.pop(most_common_token_pair)
 
 def train_bpe(
     input_data: str,
@@ -92,15 +166,30 @@ def train_bpe(
         input_data
     )
 
-    word_count = dict[tuple[bytes], int]()
+    token_pair_count = dict[tuple[bytes, bytes], int]()
+    token_pair_appear = dict[tuple[bytes, bytes], set[int]]()
+    words = list[tuple[bytes]]()
     for chunk in chunks:
-        word_count = pre_tokenization(word_count, chunk)
+        pre_tokenization(
+            chunk, 
+            words,
+            token_pair_count, 
+            token_pair_appear,
+        )
 
     while cur_vocab_size < vocab_size:
-        most_common_adj_token_pair = find_most_common_adj_token_pair(word_count)
-        merges.append(most_common_adj_token_pair)
-        word_count = merge_most_common_adj_token_pair(word_count, most_common_adj_token_pair)
-        vocabulary[cur_vocab_size] = b"".join(most_common_adj_token_pair)
+        most_common_token_pair = find_most_common_token_pair(token_pair_count)
+        merges.append(most_common_token_pair)
+
+        
+        merge_most_common_token_pair(
+            most_common_token_pair,
+            words,
+            token_pair_count,
+            token_pair_appear,
+        )
+        
+        vocabulary[cur_vocab_size] = b"".join(most_common_token_pair)
         cur_vocab_size += 1
     
     return vocabulary, merges
