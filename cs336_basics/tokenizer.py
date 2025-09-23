@@ -1,20 +1,89 @@
 import regex as re 
 import time
+import json
+import pickle
 from typing import Any, BinaryIO
 from cs336_basics.pretokenization_example import find_chunk_boundaries
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Pool
 
 def pre_tokenization(
-    input: str,
+    input_data: str,
     word_count: dict[tuple[bytes], int],
 ):
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    for match in re.finditer(PAT, input):
+    for match in re.finditer(PAT, input_data):
         # count the appearances of words
         word = match.group().encode("utf-8")
         # we represent each word as a tuple of bytes
-        word = tuple([word[i:i+1] for i in range(len(word))])
         word_count[word] = word_count.get(word, 0) + 1
+
+
+def split_special_token(
+    input_data: str,
+    special_tokens: list[str],
+) -> list[str]:
+    pattern = "|".join(re.escape(token) for token in special_tokens)
+    chunks = re.split(pattern, input_data)
+    return chunks
+
+
+def init_vocab(
+    special_tokens: list[str],
+) -> dict[int, bytes]:
+    # initialize the vocabulary
+    vocab = dict[int, bytes]()
+    for i in range(256):
+        vocab[i] = i.to_bytes()
+    
+    # the vocabulary size right now
+    cur_vocab_size = 256
+    for special_token in special_tokens:
+        vocab[cur_vocab_size] = special_token.encode("utf-8")
+        cur_vocab_size += 1
+    return vocab
+
+
+def pre_tokenization_worker(
+    input_path: str,
+    start: int, 
+    end: int,
+    special_tokens: list[str],
+) -> dict[tuple[bytes], int]:
+    word_count = dict[tuple[bytes], int]()
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        input_data = f.read(end - start).decode("utf-8", errors="ignore")
+        chunks = split_special_token(input_data, special_tokens)
+        for chunk in chunks:
+            pre_tokenization(chunk, word_count)
+    return word_count
+
+
+def merge_word_counts(
+    local_word_counts: list[dict[tuple[bytes], int]],
+):
+    global_word_count = dict[tuple[bytes], int]()
+    for word_count in local_word_counts:
+        # always merge smaller one to larger one
+        if len(word_count) > len(global_word_count):
+            global_word_count, word_count = (
+                word_count, global_word_count
+            )
+        for (k, v) in word_count.items():
+            global_word_count[k] = (
+                global_word_count.get(k, 0) + v
+            )
+    return global_word_count
+
+
+def post_process_word_count(
+    word_count: dict[tuple[bytes], int]
+):
+    new_word_count = dict[tuple[bytes], int]()
+    for (word, count) in word_count.items():
+        byte_level_word = tuple([word[i:i+1] for i in range(len(word))])
+        new_word_count[byte_level_word] = count
+    return new_word_count
 
 
 def init_token_pair_count_and_loc(
@@ -158,7 +227,7 @@ def merge_most_common_token_pair(
     # print(token_pair_count)
 
 def train_bpe(
-    input_data: str,
+    input_path: str,
     vocab_size: int,
     special_tokens: list[str],
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
@@ -166,30 +235,32 @@ def train_bpe(
     assert len(special_tokens) + 256 <= vocab_size, "vocba_size too small,"  \
         "cannot initialize the vocabulary"
     
-    vocabulary = dict[int, bytes]()
+    vocab = init_vocab(special_tokens)
+    cur_vocab_size = len(vocab)
     merges = list[tuple[bytes, bytes]]()
 
-    # initialize the vocabulary
-    for i in range(256):
-        vocabulary[i] = i.to_bytes()
-    
-    # the vocabulary size right now
-    cur_vocab_size = 256
-    for special_token in special_tokens:
-        vocabulary[cur_vocab_size] = special_token.encode("utf-8")
-        cur_vocab_size += 1
+    # word_count = dict[tuple[bytes], int]()
+# 
+    # chunks = split_special_token(input_data, special_tokens)
+    # for chunk in chunks:
+    #     pre_tokenization(
+    #         chunk, 
+    #         word_count,
+    #     )
+    num_processes = 16
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
-    chunks = re.split(
-        "|".join(re.escape(token) for token in special_tokens), 
-        input_data
+    p = Pool(num_processes)
+
+    local_word_counts = p.starmap(
+        pre_tokenization_worker, 
+        [(input_path, boundaries[i], boundaries[i+1], special_tokens) 
+        for i in range(len(boundaries)-1)]
     )
 
-    word_count = dict[tuple[bytes], int]()
-    for chunk in chunks:
-        pre_tokenization(
-            chunk, 
-            word_count,
-        )
+    word_count = merge_word_counts(local_word_counts)
+    word_count = post_process_word_count(word_count)
     
     words, token_pair_count, token_pair_loc = (
         init_token_pair_count_and_loc(word_count)
@@ -212,10 +283,10 @@ def train_bpe(
             token_pair_loc,
         )
         
-        vocabulary[cur_vocab_size] = b"".join(most_common_token_pair)
+        vocab[cur_vocab_size] = b"".join(most_common_token_pair)
         cur_vocab_size += 1
     
-    return vocabulary, merges
+    return vocab, merges
 
 
 def train_bpe_from_file(
@@ -223,9 +294,9 @@ def train_bpe_from_file(
     vocab_size: int,
     special_tokens: list[str],
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    with open(input_path, "r") as f:
-        data = f.read()
-    return train_bpe(data, vocab_size, special_tokens)
+    #with open(input_path, "r") as f:
+    #    data = f.read()
+    return train_bpe(input_path, vocab_size, special_tokens)
 
 
 if __name__ == "__main__":
@@ -234,12 +305,19 @@ if __name__ == "__main__":
     # print(vocab)
     # print(merges)
     start_time = time.time()
-#
-    train_bpe_from_file(
-        "data/TinyStoriesV2-GPT4-valid.txt",
-        1000,
+## 
+    dataset = "TinyStoriesV2-GPT4-train"
+    vocab, merges = train_bpe_from_file(
+        f"data/{dataset}.txt",
+        10000,
         ["<|endoftext|>"]
     )
-#
     end_time = time.time()
     print("Total time:", end_time - start_time)
+
+    with open(f"data/{dataset}-vocab.pkl", "wb") as f:
+        pickle.dump(vocab, f)
+    with open(f"data/{dataset}-merges.pkl", "wb") as f:
+        pickle.dump(merges, f)
+## 
+    
